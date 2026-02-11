@@ -2,9 +2,9 @@
 """
 X (Twitter) Search MCP Server via xAI Agent Tools API
 
-Uses xAI's Responses API with the x_search server-side tool to search
-X/Twitter posts. Grok autonomously performs keyword search, semantic search,
-user search, and thread fetch on X.
+Uses xAI's Responses API with built-in x_search tool to search
+X/Twitter posts. This is the new Agent Tools API that replaced
+the deprecated Live Search API.
 
 Required environment variable:
     XAI_API_KEY - Your xAI API key from https://console.x.ai/
@@ -26,6 +26,7 @@ Usage with Claude Desktop:
 
 import json
 import os
+import sys
 from enum import Enum
 from typing import Optional
 
@@ -38,7 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # ---------------------------------------------------------------------------
 
 XAI_API_BASE = "https://api.x.ai/v1"
-XAI_MODEL = "grok-3-mini-fast"
+XAI_MODEL = "grok-3-mini"
 DEFAULT_TIMEOUT = 120.0
 MAX_RESULTS_DEFAULT = 10
 
@@ -65,23 +66,21 @@ def _get_api_key() -> str:
 
 
 async def _call_responses_api(
-    prompt: str,
+    user_prompt: str,
     *,
     x_search_config: Optional[dict] = None,
 ) -> str:
-    """Call xAI Responses API with x_search server-side tool.
+    """Call xAI Responses API with x_search tool.
 
-    The Responses API handles the entire agentic search loop server-side:
-    Grok autonomously searches X, analyzes results, and returns a
-    comprehensive answer.
+    Uses the new /v1/responses endpoint with Agent Tools API.
 
     Args:
-        prompt: The user prompt to send.
-        x_search_config: Optional x_search tool configuration
-            (e.g. allowed_x_handles, from_date, to_date).
+        user_prompt: The user query to search for.
+        x_search_config: Optional dict of x_search tool parameters
+            (allowed_x_handles, excluded_x_handles, from_date, to_date, etc.)
 
     Returns:
-        The text response from Grok including X search results.
+        The text response from the API.
     """
     api_key = _get_api_key()
     headers = {
@@ -94,10 +93,10 @@ async def _call_responses_api(
     if x_search_config:
         x_search_tool.update(x_search_config)
 
-    body: dict = {
+    body = {
         "model": XAI_MODEL,
         "input": [
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": user_prompt},
         ],
         "tools": [x_search_tool],
     }
@@ -111,7 +110,7 @@ async def _call_responses_api(
         resp.raise_for_status()
         data = resp.json()
 
-    # Extract the text output from the response
+    # Extract text from the response output
     output = data.get("output", [])
     text_parts = []
     for item in output:
@@ -119,27 +118,14 @@ async def _call_responses_api(
             for content in item.get("content", []):
                 if content.get("type") == "output_text":
                     text_parts.append(content.get("text", ""))
+        elif isinstance(item.get("text"), str):
+            text_parts.append(item["text"])
 
-    if not text_parts:
-        # Fallback: return the raw response for debugging
-        return json.dumps(data, indent=2, ensure_ascii=False)
+    if text_parts:
+        return "\n".join(text_parts)
 
-    result = "\n".join(text_parts)
-
-    # Append citations if available
-    citations = []
-    for item in output:
-        if item.get("type") == "message":
-            for content in item.get("content", []):
-                for annotation in content.get("annotations", []):
-                    if annotation.get("type") == "url_citation":
-                        citations.append(annotation.get("url", ""))
-    if citations:
-        result += "\n\n---\nSources:\n"
-        for url in dict.fromkeys(citations):  # deduplicate preserving order
-            result += f"- {url}\n"
-
-    return result
+    # Fallback: return raw JSON if we can't parse text
+    return json.dumps(data, indent=2, ensure_ascii=False)
 
 
 def _handle_api_error(e: Exception) -> str:
@@ -213,6 +199,14 @@ class XSearchPostsInput(BaseModel):
             "Leave empty for all languages."
         ),
     )
+    from_date: Optional[str] = Field(
+        default=None,
+        description="Search start date in YYYY-MM-DD format (e.g., '2025-01-01')",
+    )
+    to_date: Optional[str] = Field(
+        default=None,
+        description="Search end date in YYYY-MM-DD format (e.g., '2025-12-31')",
+    )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
         description="Output format: 'markdown' for readable text, 'json' for structured data",
@@ -242,6 +236,14 @@ class XGetUserPostsInput(BaseModel):
     topic_filter: Optional[str] = Field(
         default=None,
         description="Optional topic to filter posts by (e.g., 'AI', 'cybersecurity')",
+    )
+    from_date: Optional[str] = Field(
+        default=None,
+        description="Search start date in YYYY-MM-DD format",
+    )
+    to_date: Optional[str] = Field(
+        default=None,
+        description="Search end date in YYYY-MM-DD format",
     )
     response_format: ResponseFormat = Field(
         default=ResponseFormat.MARKDOWN,
@@ -279,6 +281,25 @@ class XTrendingInput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _build_x_search_config(
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    allowed_handles: Optional[list] = None,
+    excluded_handles: Optional[list] = None,
+) -> Optional[dict]:
+    """Build x_search tool configuration dict."""
+    config: dict = {}
+    if from_date:
+        config["from_date"] = from_date
+    if to_date:
+        config["to_date"] = to_date
+    if allowed_handles:
+        config["allowed_x_handles"] = allowed_handles
+    if excluded_handles:
+        config["excluded_x_handles"] = excluded_handles
+    return config if config else None
+
+
 @mcp.tool(
     name="x_search_posts",
     annotations={
@@ -292,8 +313,8 @@ class XTrendingInput(BaseModel):
 async def x_search_posts(params: XSearchPostsInput) -> str:
     """Search for posts on X (Twitter) by keywords, hashtags, or topics.
 
-    Uses xAI's Responses API with the x_search server-side tool to find
-    recent and relevant X posts matching the search query.
+    Uses xAI's Grok API with live search to find recent and relevant
+    X posts matching the search query.
 
     Args:
         params (XSearchPostsInput): Validated input containing:
@@ -320,7 +341,12 @@ async def x_search_posts(params: XSearchPostsInput) -> str:
             f"Format the output as {fmt}."
         )
 
-        return await _call_responses_api(prompt)
+        x_config = _build_x_search_config(
+            from_date=params.from_date,
+            to_date=params.to_date,
+        )
+
+        return await _call_responses_api(prompt, x_search_config=x_config)
 
     except Exception as e:
         return _handle_api_error(e)
@@ -339,8 +365,8 @@ async def x_search_posts(params: XSearchPostsInput) -> str:
 async def x_get_user_posts(params: XGetUserPostsInput) -> str:
     """Retrieve recent posts from a specific X (Twitter) user.
 
-    Uses xAI's Responses API with the x_search server-side tool to find
-    recent posts from the specified user account.
+    Uses xAI's Grok API with live search to find recent posts
+    from the specified user account.
 
     Args:
         params (XGetUserPostsInput): Validated input containing:
@@ -367,8 +393,11 @@ async def x_get_user_posts(params: XGetUserPostsInput) -> str:
             f"Format the output as {fmt}."
         )
 
-        # Use allowed_x_handles to scope search to this user
-        x_config = {"allowed_x_handles": [params.username]}
+        x_config = _build_x_search_config(
+            from_date=params.from_date,
+            to_date=params.to_date,
+            allowed_handles=[params.username],
+        )
 
         return await _call_responses_api(prompt, x_search_config=x_config)
 
@@ -389,8 +418,8 @@ async def x_get_user_posts(params: XGetUserPostsInput) -> str:
 async def x_get_trending(params: XTrendingInput) -> str:
     """Get current trending topics and hashtags on X (Twitter).
 
-    Uses xAI's Responses API with the x_search server-side tool to find
-    what's currently trending on X.
+    Uses xAI's Grok API with live search to find what's currently
+    trending on X.
 
     Args:
         params (XTrendingInput): Validated input containing:
@@ -412,8 +441,7 @@ async def x_get_trending(params: XTrendingInput) -> str:
         prompt = (
             f"What are the current trending topics and hashtags on X (Twitter)"
             f"{region_part}?{category_part}\n"
-            f"List the top trending topics with brief descriptions of why "
-            f"they're trending.\n"
+            f"List the top trending topics with brief descriptions of why they are trending.\n"
             f"Format the output as {fmt}."
         )
 
