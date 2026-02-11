@@ -39,7 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # ---------------------------------------------------------------------------
 
 XAI_API_BASE = "https://api.x.ai/v1"
-XAI_MODEL = "grok-3-mini"
+XAI_MODEL = "grok-4-1-fast"
 DEFAULT_TIMEOUT = 120.0
 MAX_RESULTS_DEFAULT = 10
 
