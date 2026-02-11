@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-X (Twitter) Search MCP Server via xAI API
+X (Twitter) Search MCP Server via xAI Agent Tools API
 
-Uses xAI's Grok API with built-in live search capabilities to search
-X/Twitter posts. Grok has native access to X data through its API.
+Uses xAI's Responses API with the x_search server-side tool to search
+X/Twitter posts. Grok autonomously performs keyword search, semantic search,
+user search, and thread fetch on X.
 
 Required environment variable:
     XAI_API_KEY - Your xAI API key from https://console.x.ai/
@@ -13,7 +14,7 @@ Usage with Claude Desktop:
     {
         "mcpServers": {
             "x_search": {
-                "command": "python",
+                "command": "/path/to/.venv/bin/python3",
                 "args": ["/path/to/x_search_mcp.py"],
                 "env": {
                     "XAI_API_KEY": "your-api-key-here"
@@ -25,7 +26,6 @@ Usage with Claude Desktop:
 
 import json
 import os
-import sys
 from enum import Enum
 from typing import Optional
 
@@ -38,8 +38,8 @@ from pydantic import BaseModel, ConfigDict, Field
 # ---------------------------------------------------------------------------
 
 XAI_API_BASE = "https://api.x.ai/v1"
-XAI_MODEL = "grok-3-mini"
-DEFAULT_TIMEOUT = 60.0
+XAI_MODEL = "grok-3-mini-fast"
+DEFAULT_TIMEOUT = 120.0
 MAX_RESULTS_DEFAULT = 10
 
 # ---------------------------------------------------------------------------
@@ -64,15 +64,24 @@ def _get_api_key() -> str:
     return key
 
 
-async def _call_grok(prompt: str, *, search_enabled: bool = True) -> str:
-    """Call xAI Grok API with optional live search for X data.
+async def _call_responses_api(
+    prompt: str,
+    *,
+    x_search_config: Optional[dict] = None,
+) -> str:
+    """Call xAI Responses API with x_search server-side tool.
+
+    The Responses API handles the entire agentic search loop server-side:
+    Grok autonomously searches X, analyzes results, and returns a
+    comprehensive answer.
 
     Args:
-        prompt: The prompt to send to Grok.
-        search_enabled: Whether to enable live X/web search.
+        prompt: The user prompt to send.
+        x_search_config: Optional x_search tool configuration
+            (e.g. allowed_x_handles, from_date, to_date).
 
     Returns:
-        The text response from Grok.
+        The text response from Grok including X search results.
     """
     api_key = _get_api_key()
     headers = {
@@ -80,40 +89,57 @@ async def _call_grok(prompt: str, *, search_enabled: bool = True) -> str:
         "Content-Type": "application/json",
     }
 
+    # Build x_search tool config
+    x_search_tool: dict = {"type": "x_search"}
+    if x_search_config:
+        x_search_tool.update(x_search_config)
+
     body: dict = {
         "model": XAI_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful assistant that searches X (Twitter) posts. "
-                    "Return results in structured JSON format. "
-                    "For each post found, include: author username, author display name, "
-                    "post text content, approximate date/time, and engagement metrics "
-                    "(likes, reposts, replies) if available. "
-                    "Always respond with valid JSON only, no markdown fences."
-                ),
-            },
+        "input": [
             {"role": "user", "content": prompt},
         ],
-        "search_parameters": {"mode": "auto" if search_enabled else "off"},
-        "temperature": 0.0,
+        "tools": [x_search_tool],
     }
 
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         resp = await client.post(
-            f"{XAI_API_BASE}/chat/completions",
+            f"{XAI_API_BASE}/responses",
             headers=headers,
             json=body,
         )
         resp.raise_for_status()
         data = resp.json()
 
-    # Extract the assistant message
-    choices = data.get("choices", [])
-    if not choices:
-        return json.dumps({"error": "No response from Grok API"})
-    return choices[0]["message"]["content"]
+    # Extract the text output from the response
+    output = data.get("output", [])
+    text_parts = []
+    for item in output:
+        if item.get("type") == "message":
+            for content in item.get("content", []):
+                if content.get("type") == "output_text":
+                    text_parts.append(content.get("text", ""))
+
+    if not text_parts:
+        # Fallback: return the raw response for debugging
+        return json.dumps(data, indent=2, ensure_ascii=False)
+
+    result = "\n".join(text_parts)
+
+    # Append citations if available
+    citations = []
+    for item in output:
+        if item.get("type") == "message":
+            for content in item.get("content", []):
+                for annotation in content.get("annotations", []):
+                    if annotation.get("type") == "url_citation":
+                        citations.append(annotation.get("url", ""))
+    if citations:
+        result += "\n\n---\nSources:\n"
+        for url in dict.fromkeys(citations):  # deduplicate preserving order
+            result += f"- {url}\n"
+
+    return result
 
 
 def _handle_api_error(e: Exception) -> str:
@@ -130,7 +156,6 @@ def _handle_api_error(e: Exception) -> str:
                 "error": "Rate limit exceeded. Please wait before retrying.",
                 "status": 429,
             })
-        # Try to extract error detail from response body
         try:
             detail = e.response.json()
         except Exception:
@@ -267,8 +292,8 @@ class XTrendingInput(BaseModel):
 async def x_search_posts(params: XSearchPostsInput) -> str:
     """Search for posts on X (Twitter) by keywords, hashtags, or topics.
 
-    Uses xAI's Grok API with live search to find recent and relevant
-    X posts matching the search query.
+    Uses xAI's Responses API with the x_search server-side tool to find
+    recent and relevant X posts matching the search query.
 
     Args:
         params (XSearchPostsInput): Validated input containing:
@@ -295,7 +320,7 @@ async def x_search_posts(params: XSearchPostsInput) -> str:
             f"Format the output as {fmt}."
         )
 
-        return await _call_grok(prompt, search_enabled=True)
+        return await _call_responses_api(prompt)
 
     except Exception as e:
         return _handle_api_error(e)
@@ -314,8 +339,8 @@ async def x_search_posts(params: XSearchPostsInput) -> str:
 async def x_get_user_posts(params: XGetUserPostsInput) -> str:
     """Retrieve recent posts from a specific X (Twitter) user.
 
-    Uses xAI's Grok API with live search to find recent posts
-    from the specified user account.
+    Uses xAI's Responses API with the x_search server-side tool to find
+    recent posts from the specified user account.
 
     Args:
         params (XGetUserPostsInput): Validated input containing:
@@ -342,7 +367,10 @@ async def x_get_user_posts(params: XGetUserPostsInput) -> str:
             f"Format the output as {fmt}."
         )
 
-        return await _call_grok(prompt, search_enabled=True)
+        # Use allowed_x_handles to scope search to this user
+        x_config = {"allowed_x_handles": [params.username]}
+
+        return await _call_responses_api(prompt, x_search_config=x_config)
 
     except Exception as e:
         return _handle_api_error(e)
@@ -361,8 +389,8 @@ async def x_get_user_posts(params: XGetUserPostsInput) -> str:
 async def x_get_trending(params: XTrendingInput) -> str:
     """Get current trending topics and hashtags on X (Twitter).
 
-    Uses xAI's Grok API with live search to find what's currently
-    trending on X.
+    Uses xAI's Responses API with the x_search server-side tool to find
+    what's currently trending on X.
 
     Args:
         params (XTrendingInput): Validated input containing:
@@ -384,11 +412,12 @@ async def x_get_trending(params: XTrendingInput) -> str:
         prompt = (
             f"What are the current trending topics and hashtags on X (Twitter)"
             f"{region_part}?{category_part}\n"
-            f"List the top trending topics with brief descriptions of why they're trending.\n"
+            f"List the top trending topics with brief descriptions of why "
+            f"they're trending.\n"
             f"Format the output as {fmt}."
         )
 
-        return await _call_grok(prompt, search_enabled=True)
+        return await _call_responses_api(prompt)
 
     except Exception as e:
         return _handle_api_error(e)

@@ -1,6 +1,6 @@
 # X (Twitter) Search MCP Server
 
-xAI の Grok API を利用して、Claude Desktop から X (Twitter) の投稿検索ができる MCP サーバーです。
+xAI の Responses API + Agent Tools (x_search) を利用して、Claude Desktop から X (Twitter) の投稿検索ができる MCP サーバーです。
 
 ## 機能
 
@@ -17,9 +17,12 @@ xAI の Grok API を利用して、Claude Desktop から X (Twitter) の投稿�
 - Python 3.10+
 - xAI API キー（ https://console.x.ai/ から取得）
 
-### 2. 依存パッケージのインストール
+### 2. インストール
 
 ```bash
+cd x-search-mcp
+python3 -m venv .venv
+source .venv/bin/activate
 pip install mcp httpx pydantic
 ```
 
@@ -34,8 +37,8 @@ pip install mcp httpx pydantic
 {
     "mcpServers": {
         "x_search": {
-            "command": "python",
-            "args": ["/path/to/x_search_mcp.py"],
+            "command": "/path/to/x-search-mcp/.venv/bin/python3",
+            "args": ["/path/to/x-search-mcp/x_search_mcp.py"],
             "env": {
                 "XAI_API_KEY": "xai-xxxxxxxxxxxxxxxxxxxxxxxx"
             }
@@ -44,7 +47,7 @@ pip install mcp httpx pydantic
 }
 ```
 
-> `/path/to/x_search_mcp.py` は実際のファイルパスに置き換えてください。
+> パスは実際の環境に合わせて変更してください。
 
 ### 4. Claude Desktop を再起動
 
@@ -59,11 +62,11 @@ Claude Desktop で以下のように話しかけるだけです：
 - 「日本でのトレンドを教えて」
 - 「#cybersecurity のツイートを日本語で検索」
 
-## 注意事項
+## API について
 
-- xAI API の利用料金が発生します（Grok API の料金体系に準じます）
-- Grok のライブ検索機能を経由するため、リアルタイムのデータに近い結果が返りますが、完全なリアルタイム性は保証されません
-- `grok-3-mini` モデルを使用しています。必要に応じてコード内の `XAI_MODEL` を変更できます
+このサーバーは xAI の **Responses API** (`/v1/responses`) と **x_search サーバーサイドツール**を使用しています。旧 Live Search API (`search_parameters`) は 2026年1月12日に廃止されました。
+
+Grok がサーバーサイドで自律的に X を検索・分析し、結果を返すエージェンティックな仕組みです。
 
 ## モデル変更
 
@@ -71,5 +74,9 @@ Claude Desktop で以下のように話しかけるだけです：
 
 | モデル | 特徴 |
 |---|---|
-| `grok-3-mini` | 軽量・低コスト（デフォルト） |
-| `grok-3` | 高精度・高コスト |
+| `grok-3-mini-fast` | 軽量・低コスト（デフォルト） |
+| `grok-4-1-fast` | 高精度・ツール呼び出し最適化 |
+
+## ライセンス
+
+MIT
