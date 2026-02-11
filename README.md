@@ -1,70 +1,75 @@
-## **Overview**
+# X (Twitter) Search MCP Server
 
-Recorded Future Collective Insights is a type of analytics that provides clients a complete view of what threats matters to their organization. Collective Insights aggregates detections across client integrations confirming indicators related to malicious behavior or high-risk activity. This helps TI and SecOps users better prevent and protect client networks by prioritizing actions based on which detections and TTPs are most common across their networks. This article will walk through how to setup Collective Insights for CrowdStrike using the [Recorded Future Collective Insights API](https://support.recordedfuture.com/hc/en-us/articles/15847735339923-Collective-Insights-API).
+xAI の Grok API を利用して、Claude Desktop から X (Twitter) の投稿検索ができる MCP サーバーです。
 
-The following script will ingest detections from CrowdStrike Falcon with behaviors from the previous 24 hours. This timeframe can be adjusted to backfill any additional collective insights. The behaviors from these detections are then filtered by a user set severity and confidence score to determine what is sent off to Recorded Future’s Collective Insights API.
+## 機能
 
-Fields collected from each detection by Recorded Future:
+| ツール名 | 機能 |
+|---|---|
+| `x_search_posts` | キーワード・ハッシュタグ・トピックで X の投稿を検索 |
+| `x_get_user_posts` | 特定ユーザーの最近の投稿を取得 |
+| `x_get_trending` | トレンドトピックを取得 |
 
-- `id` - The ID of a detection
-- `name` - The description of a behavior
-- `timestamp` - The timestamp of a behavior associated with a detection
-- `type` - The behavior IOC type
-- `value` - The behavior IOC value
+## セットアップ
 
-## **Prerequisites**
+### 1. 必要なもの
 
-The following items be installed/gathered before the setup of the integration script
+- Python 3.10+
+- xAI API キー（ https://console.x.ai/ から取得）
 
-1. Python v3.8 or greater must be installed
-2. Client must have CrowdStrike Falcon
-3. Client must be able to host the script in an environment with internet access and file write access.
-   1. Server/Workstation for script to run on schedule
-   2. Internet Access to Recorded Future API & CrowdStrike Falcon API
-   3. Whitelisted [api.recordedfuture.com](http://api.recordedfuture.com/)
-   4. Ability to write log files to the script directory
-4. Client must have Recorded Future API Token with access to Collective Insights API
-   1. This can be provided by your consultant or account team
-5. Client must have the following from CrowdStrike in order for the script to retrieve your CrowdStrike Access Token:
+### 2. 依存パッケージのインストール
 
-   1. CrowdStrike Client ID
-   2. CrowdStrike Client Secret
+```bash
+pip install mcp httpx pydantic
+```
 
-      1. [CrowdStrike Falcon API](https://www.crowdstrike.com/blog/tech-center/get-access-falcon-apis/)
+### 3. Claude Desktop の設定
 
-# **Installation**
+`claude_desktop_config.json` に以下を追加してください：
 
-The CrowdStrike Collective Insights Python script can be found on the Recorded Future support pages or by speaking to your account team.
+**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 
-Once package has been provided and downloaded to the machine where installation will be ran the following steps can be taken to configure and run the script for the first time.
+```json
+{
+    "mcpServers": {
+        "x_search": {
+            "command": "python",
+            "args": ["/path/to/x_search_mcp.py"],
+            "env": {
+                "XAI_API_KEY": "xai-xxxxxxxxxxxxxxxxxxxxxxxx"
+            }
+        }
+    }
+}
+```
 
-You may opt to store client credentials/secrets as environment variables instead of passing them as parameters to the script. If you choose to do so, you will need to set the following environment variables:
+> `/path/to/x_search_mcp.py` は実際のファイルパスに置き換えてください。
 
-- `RF_API_KEY`: Recorded Future API Key
-- `CS_CLIENT_ID`: CrowdStrike Client ID
-- `CS_CLIENT_SECRET`: CrowdStrike Client Secret
+### 4. Claude Desktop を再起動
 
-Set-up Instructions
+設定後、Claude Desktop を再起動すると MCP サーバーが認識されます。
 
-1. Setup a new virtual environment to install dependencies and run the script from:`virtualenv venv --python=python3.8`
-2. Activate new virtual environment:`. venv/bin/activate`
-3. Install dependencies from requirements.txt: `pip3 install -r requirements.txt`
-4. Run python script manually to confirm deployment is successful: `python CS-Collective_Insights.py -k RF_API_KEY -ccid CROWDSTRIKE_CLIENT_ID -ccs CROWDSTRIKE_CLIENT_SECRET`
-5. Setup script to run on schedule daily to ingest events and send to collective insights:
-   1. Example cron schedule to run at 00:15: `15 0 * * * <FILE_DIR>/venv/bin/python3 <FILE_DIR>/CS-Collective_Insights.py -k RF_API_KEY -ccid CROWDSTRIKE_CLIENT_ID -ccs CROWDSTRIKE_CLIENT_SECRET`
+## 使用例
 
-# **Troubleshooting**
+Claude Desktop で以下のように話しかけるだけです：
 
-The below section is for providing assistance with troubleshooting when having issues running the script.
+- 「AIに関する最新のツイートを検索して」
+- 「@elonmusk の最近の投稿を見せて」
+- 「日本でのトレンドを教えて」
+- 「#cybersecurity のツイートを日本語で検索」
 
-- Script is failing due to modules not installed.
-  - Try confirming either the requirements.txt was installed properly with pip3 and by running `pip freeze` to confirm the modules are installed.
-  - Confirm that the virtual environment where the python packages were installed is activated
-- Not authorized to submit to Recorded Future Collective Insights API
-  - Confirm that the Recorded Future API token has the correct Collective Insights API permissions activated
-- Not authorized to collect events from CrowdStrike Falcon
-  - Confirm that the correct Access Levels & Permissions are enabled for the client ID & client secret
-    - [CrowdStrike Falcon API](https://www.crowdstrike.com/blog/tech-center/get-access-falcon-apis/)
-  - Confirm that the RF API Key, CS Client ID, & CS Client Secret are in the correct parameter locations in the script
-- Why am I ingesting 800 events from CrowdStrike but the log says I’ve only submitted 200 indicators?
-  - Collective Insights has filtering for unique indicators when submitting via the API.
+## 注意事項
+
+- xAI API の利用料金が発生します（Grok API の料金体系に準じます）
+- Grok のライブ検索機能を経由するため、リアルタイムのデータに近い結果が返りますが、完全なリアルタイム性は保証されません
+- `grok-3-mini` モデルを使用しています。必要に応じてコード内の `XAI_MODEL` を変更できます
+
+## モデル変更
+
+コスト・精度のバランスに応じて `XAI_MODEL` を変更可能です：
+
+| モデル | 特徴 |
+|---|---|
+| `grok-3-mini` | 軽量・低コスト（デフォルト） |
+| `grok-3` | 高精度・高コスト |
