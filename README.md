@@ -1,6 +1,6 @@
 # X (Twitter) Search MCP Server
 
-xAI の [Responses API](https://docs.x.ai/developers/tools/overview) + [x_search サーバーサイドツール](https://docs.x.ai/developers/tools/x-search)を利用して、Claude Desktop / claude.ai から X (Twitter) の投稿をリアルタイム検索できる MCP サーバーです。
+xAI の [Responses API](https://docs.x.ai/developers/tools/overview) + [x_search サーバーサイドツール](https://docs.x.ai/developers/tools/x-search)を利用して、MCP 対応クライアントから X (Twitter) の投稿をリアルタイム検索できる MCP サーバーです。
 
 ## 機能
 
@@ -9,6 +9,24 @@ xAI の [Responses API](https://docs.x.ai/developers/tools/overview) + [x_search
 | `x_search_posts` | キーワード・ハッシュタグ・トピックで X の投稿を検索 |
 | `x_get_user_posts` | 特定ユーザーの最近の投稿を取得（`allowed_x_handles` で絞り込み） |
 | `x_get_trending` | トレンドトピックを取得 |
+
+## 対応クライアント
+
+stdio トランスポートに対応した MCP クライアントであれば利用できます。代表的なものを以下に挙げます：
+
+| クライアント | 種類 |
+|---|---|
+| [Claude Desktop](https://claude.ai/download) | デスクトップアプリ |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | CLI |
+| [Cursor](https://www.cursor.com/) | コードエディタ |
+| [Windsurf](https://codeium.com/windsurf) | コードエディタ |
+| [VS Code (GitHub Copilot)](https://code.visualstudio.com/) | コードエディタ |
+| [Cline](https://github.com/cline/cline) | VS Code 拡張 |
+| [Roo Code](https://github.com/RooVetGit/Roo-Code) | VS Code 拡張 |
+| [Cherry Studio](https://github.com/kangfenmao/cherry-studio) | デスクトップアプリ |
+| [5ire](https://github.com/nanbingxyz/5ire) | デスクトップアプリ |
+
+その他の MCP 対応クライアントは [MCP Clients 一覧](https://modelcontextprotocol.io/clients) を参照してください。
 
 ## セットアップ
 
@@ -38,10 +56,10 @@ pip install -r requirements.txt
 
 ### 2. 仮想環境の Python パスを確認
 
-Claude Desktop の設定にはフルパスが必要です。以下のコマンドで確認してください：
+MCP クライアントの設定にはフルパスが必要です。以下のコマンドで確認してください：
 
 ```bash
-# macOS / Linux
+# macOS / Linux（venv を有効化した状態で）
 which python3
 # 例: /Users/yourname/src/x-search-mcp/.venv/bin/python3
 
@@ -50,13 +68,10 @@ which python3
 # 例: C:\Users\yourname\src\x-search-mcp\.venv\Scripts\python.exe
 ```
 
-### 3. Claude Desktop の設定
+### 3. MCP クライアントの設定
 
-`claude_desktop_config.json` を開いて `mcpServers` に以下を追加します。
-
-設定ファイルの場所：
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+ほとんどの MCP クライアントは同じ JSON 形式の設定に対応しています。
+以下の内容をお使いのクライアントの MCP 設定に追加してください：
 
 ```json
 {
@@ -77,30 +92,27 @@ which python3
 > - `args` には `x_search_mcp.py` の**絶対パス**を指定してください。
 > - `XAI_API_KEY` には https://console.x.ai/ で取得した API キーを設定してください。
 
-### 4. Claude Desktop を再起動
+<details>
+<summary>クライアント別の設定ファイルの場所</summary>
 
-設定を保存したら Claude Desktop を再起動してください。MCP サーバーが認識され、X 検索ツールが使えるようになります。
+| クライアント | 設定ファイル |
+|---|---|
+| Claude Desktop (macOS) | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Claude Desktop (Windows) | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Claude Code | `~/.claude/settings.json` または `claude mcp add` コマンド |
+| Cursor | Settings → MCP → Add Server |
+| Windsurf | Settings → Advanced Settings → Cascade |
+| VS Code (Copilot) | Settings → MCP → Edit in settings.json |
 
-### トラブルシューティング
+</details>
 
-接続エラーが出る場合は、Claude Desktop のログを確認してください：
+### 4. クライアントを再起動
 
-```bash
-# macOS
-cat ~/Library/Logs/Claude/mcp-server-x_search.log
-```
-
-よくあるエラー：
-| エラー | 原因 | 対処 |
-|---|---|---|
-| `Failed to spawn process: No such file or directory` | Python パスが間違っている | `.venv/bin/python3` のフルパスを `command` に指定 |
-| `status 400: model not supported` | grok-3 系モデルを使用 | `XAI_MODEL` を `grok-4-1-fast` に変更（デフォルトで設定済み） |
-| `status 401` | API キーが無効 | `XAI_API_KEY` を確認 |
-| `status 410: Live search is deprecated` | 旧 API を使用 | 最新版に更新（`git pull`） |
+設定を保存したらクライアントを再起動してください。MCP サーバーが認識され、X 検索ツールが使えるようになります。
 
 ## 使用例
 
-Claude Desktop / claude.ai で以下のように話しかけるだけです：
+MCP クライアントで以下のように話しかけるだけです：
 
 - 「AIに関する最新のツイートを検索して」
 - 「@elonmusk の最近の投稿を見せて」
@@ -110,12 +122,12 @@ Claude Desktop / claude.ai で以下のように話しかけるだけです：
 ## アーキテクチャ
 
 ```
-Claude <-> MCP Server <-> xAI Responses API (/v1/responses)
-                              |
-                         x_search tool
-                        (server-side)
-                              |
-                         X (Twitter) data
+MCP Client <-> MCP Server (stdio) <-> xAI Responses API (/v1/responses)
+                                            |
+                                       x_search tool
+                                      (server-side)
+                                            |
+                                       X (Twitter) data
 ```
 
 このサーバーは xAI の **Responses API** と **x_search サーバーサイドツール**を使用しています。
@@ -136,6 +148,22 @@ Grok がサーバーサイドで自律的に X を検索・分析し、結果を
 モデルを変更する場合は `x_search_mcp.py` 内の `XAI_MODEL` 定数を編集してください。
 
 > **注意**: `grok-3` 系モデルでは x_search ツールは利用できません（400 エラーになります）。
+
+## トラブルシューティング
+
+| エラー | 原因 | 対処 |
+|---|---|---|
+| `Failed to spawn process: No such file or directory` | Python パスが間違っている | `.venv/bin/python3` のフルパスを `command` に指定 |
+| `status 400: model not supported` | grok-3 系モデルを使用 | `XAI_MODEL` を `grok-4-1-fast` に変更（デフォルトで設定済み） |
+| `status 401` | API キーが無効 | `XAI_API_KEY` を確認 |
+| `status 410: Live search is deprecated` | 旧 API を使用 | 最新版に更新（`git pull`） |
+
+Claude Desktop の場合、ログは以下で確認できます：
+
+```bash
+# macOS
+cat ~/Library/Logs/Claude/mcp-server-x_search.log
+```
 
 ## 料金
 
