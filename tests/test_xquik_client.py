@@ -2,6 +2,7 @@
 
 import json
 
+import httpx
 import xquik_client
 
 
@@ -16,6 +17,40 @@ def test_available_uses_key_presence(monkeypatch):
 def test_base_url_strips_trailing_slash(monkeypatch):
     monkeypatch.setenv("XQUIK_BASE_URL", "https://example.test/api/v1/")
     assert xquik_client.base_url() == "https://example.test/api/v1"
+
+
+def test_get_sends_api_key_header(monkeypatch):
+    captured: dict = {}
+
+    class CapturingClient:
+        def __init__(self, *, timeout, headers):
+            captured["timeout"] = timeout
+            captured["headers"] = headers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, *, params):
+            captured["url"] = url
+            captured["params"] = params
+            request = httpx.Request("GET", url)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+    monkeypatch.setenv("XQUIK_API_KEY", "xquik-test-key")
+    monkeypatch.setenv("XQUIK_BASE_URL", "https://example.test/api/v1")
+    monkeypatch.setattr(xquik_client.httpx, "Client", CapturingClient)
+
+    response = xquik_client._get("/trends", params={"count": 1})
+
+    assert response == {"ok": True}
+    assert captured["headers"]["x-api-key"] == "xquik-test-key"
+    assert "Authorization" not in captured["headers"]
+    assert captured["headers"]["Accept"] == "application/json"
+    assert captured["url"] == "https://example.test/api/v1/trends"
+    assert captured["params"] == {"count": 1}
 
 
 def test_iso_boundary_converts_dates_to_utc_boundaries():

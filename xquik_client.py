@@ -88,7 +88,7 @@ def _raise_for_status(exc: httpx.HTTPStatusError) -> None:
 
 def _get(path: str, *, params: dict[str, Any]) -> dict[str, Any]:
     headers = {
-        "Authorization": f"Bearer {_api_key()}",
+        "x-api-key": _api_key(),
         "Accept": "application/json",
     }
     try:
