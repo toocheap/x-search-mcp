@@ -3,7 +3,7 @@
 The tool functions delegate to xurl_client's module-level functions, which we
 replace via monkeypatch.setattr with small fakes. Reason for monkeypatch:
 these tests verify routing and fallback logic (which backend runs, what
-happens on xurl failure) — not subprocess mechanics, which test_xurl_client.py
+happens on xurl failure) - not subprocess mechanics, which test_xurl_client.py
 covers via the injectable Runner. Replacing the high-level xurl_client
 functions is the minimal intervention to isolate routing, per project policy.
 """
@@ -13,15 +13,20 @@ import json
 import pytest
 
 import x_search_mcp
+import xquik_client
 import xurl_client
 from x_search_mcp import (
     ResponseFormat,
     XGetUserPostsInput,
     XSearchPostsInput,
+    XTrendingInput,
     _get_backend,
+    _handle_xquik_error,
     _handle_xurl_error,
+    _should_use_xquik,
     _should_use_xurl,
     x_auth_status,
+    x_get_trending,
     x_get_user_posts,
     x_search_posts,
 )
@@ -41,6 +46,31 @@ SEARCH_PAYLOAD = {
 }
 
 
+XQUIK_PAYLOAD = {
+    "tweets": [
+        {
+            "id": "2002",
+            "text": "hello xquik world",
+            "createdAt": "2026-06-06T12:00:00Z",
+            "author": {"username": "bob", "name": "Bob"},
+            "likeCount": 7,
+            "retweetCount": 3,
+            "replyCount": 2,
+            "quoteCount": 1,
+            "viewCount": 99,
+            "url": "https://x.com/bob/status/2002",
+        }
+    ]
+}
+
+
+XQUIK_TRENDS_PAYLOAD = {
+    "trends": [
+        {"name": "#Xquik", "description": "API tools", "rank": 1},
+    ]
+}
+
+
 # ===================================================================
 # _get_backend
 # ===================================================================
@@ -51,7 +81,7 @@ class TestGetBackend:
         monkeypatch.delenv("X_SEARCH_BACKEND", raising=False)
         assert _get_backend() == "auto"
 
-    @pytest.mark.parametrize("val", ["auto", "xurl", "xai"])
+    @pytest.mark.parametrize("val", ["auto", "xurl", "xquik", "xai"])
     def test_valid_values(self, monkeypatch: pytest.MonkeyPatch, val) -> None:
         monkeypatch.setenv("X_SEARCH_BACKEND", val)
         assert _get_backend() == val
@@ -81,6 +111,9 @@ class TestShouldUseXurl:
     def test_forced_xai(self) -> None:
         assert _should_use_xurl("xai") is False
 
+    def test_forced_xquik_skips_xurl(self) -> None:
+        assert _should_use_xurl("xquik") is False
+
     def test_auto_delegates_to_available_true(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -92,6 +125,32 @@ class TestShouldUseXurl:
     ) -> None:
         monkeypatch.setattr(xurl_client, "available", lambda: False)
         assert _should_use_xurl("auto") is False
+
+
+# ===================================================================
+# _should_use_xquik
+# ===================================================================
+
+
+class TestShouldUseXquik:
+    def test_forced_xquik(self) -> None:
+        assert _should_use_xquik("xquik") is True
+
+    @pytest.mark.parametrize("backend", ["xurl", "xai"])
+    def test_other_forced_backends_skip_xquik(self, backend: str) -> None:
+        assert _should_use_xquik(backend) is False
+
+    def test_auto_delegates_to_available_true(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(xquik_client, "available", lambda: True)
+        assert _should_use_xquik("auto") is True
+
+    def test_auto_delegates_to_available_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(xquik_client, "available", lambda: False)
+        assert _should_use_xquik("auto") is False
 
 
 # ===================================================================
@@ -121,6 +180,36 @@ class TestHandleXurlError:
 
     def test_generic(self) -> None:
         out = json.loads(_handle_xurl_error(xurl_client.XurlError("boom")))
+        assert out["error"] == "boom"
+
+
+# ===================================================================
+# _handle_xquik_error
+# ===================================================================
+
+
+class TestHandleXquikError:
+    def test_auth_error(self) -> None:
+        out = json.loads(_handle_xquik_error(xquik_client.XquikAuthError("x")))
+        assert out["source"] == "xquik"
+        assert "authentication" in out["error"]
+
+    def test_rate_limit(self) -> None:
+        out = json.loads(_handle_xquik_error(xquik_client.XquikRateLimitError("x")))
+        assert "429" in out["error"]
+
+    def test_quota(self) -> None:
+        out = json.loads(_handle_xquik_error(xquik_client.XquikQuotaError("x")))
+        assert "402" in out["error"]
+
+    def test_not_found(self) -> None:
+        out = json.loads(
+            _handle_xquik_error(xquik_client.XquikNotFoundError("not found"))
+        )
+        assert out["error"] == "not found"
+
+    def test_generic(self) -> None:
+        out = json.loads(_handle_xquik_error(xquik_client.XquikError("boom")))
         assert out["error"] == "boom"
 
 
@@ -200,6 +289,96 @@ class TestSearchPostsXurl:
 
 
 # ===================================================================
+# x_search_posts via Xquik
+# ===================================================================
+
+
+class TestSearchPostsXquik:
+    @pytest.fixture()
+    def force_xquik(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("X_SEARCH_BACKEND", "xquik")
+
+    async def test_routes_to_xquik_markdown(
+        self, force_xquik: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict = {}
+
+        def fake_search(query, **kwargs):
+            captured["query"] = query
+            captured["kwargs"] = kwargs
+            return XQUIK_PAYLOAD
+
+        async def boom(*a, **k):
+            raise AssertionError("xAI path must not run when backend=xquik")
+
+        monkeypatch.setattr(xquik_client, "search_recent", fake_search)
+        monkeypatch.setattr(x_search_mcp, "_call_responses_api", boom)
+
+        params = XSearchPostsInput(query="xquik", language="ja", max_results=5)
+        out = await x_search_posts(params)
+
+        assert "hello xquik world" in out
+        assert "@bob" in out
+        assert captured["query"] == "xquik lang:ja"
+        assert captured["kwargs"]["max_results"] == 5
+
+    async def test_routes_to_xquik_json(
+        self, force_xquik: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            xquik_client, "search_recent", lambda q, **k: XQUIK_PAYLOAD
+        )
+        params = XSearchPostsInput(
+            query="xquik", response_format=ResponseFormat.JSON
+        )
+        out = await x_search_posts(params)
+        parsed = json.loads(out)
+        assert parsed[0]["id"] == "2002"
+
+    async def test_xquik_error_returns_formatted_error(
+        self, force_xquik: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail(q, **k):
+            raise xquik_client.XquikAuthError("nope")
+
+        monkeypatch.setattr(xquik_client, "search_recent", fail)
+        out = await x_search_posts(XSearchPostsInput(query="xquik"))
+        assert json.loads(out)["source"] == "xquik"
+
+    async def test_auto_uses_xquik_when_xurl_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("X_SEARCH_BACKEND", "auto")
+        monkeypatch.setattr(xurl_client, "available", lambda: False)
+        monkeypatch.setattr(xquik_client, "available", lambda: True)
+        monkeypatch.setattr(
+            xquik_client, "search_recent", lambda q, **k: XQUIK_PAYLOAD
+        )
+
+        out = await x_search_posts(XSearchPostsInput(query="xquik"))
+        assert "hello xquik world" in out
+
+    async def test_auto_falls_back_to_xai_on_xquik_error(
+        self, monkeypatch: pytest.MonkeyPatch, fake_api_key: str
+    ) -> None:
+        monkeypatch.setenv("X_SEARCH_BACKEND", "auto")
+        monkeypatch.setattr(xurl_client, "available", lambda: False)
+        monkeypatch.setattr(xquik_client, "available", lambda: True)
+
+        def fail(q, **k):
+            raise xquik_client.XquikError("transient")
+
+        async def fake_xai(prompt, *, x_search_config=None):
+            return "XAI-FALLBACK-RESULT"
+
+        monkeypatch.setattr(xquik_client, "search_recent", fail)
+        monkeypatch.setattr(x_search_mcp, "_call_responses_api", fake_xai)
+
+        out = await x_search_posts(XSearchPostsInput(query="xquik"))
+        assert out == "XAI-FALLBACK-RESULT"
+
+
+# ===================================================================
 # x_get_user_posts via xurl
 # ===================================================================
 
@@ -260,6 +439,113 @@ class TestUserPostsXurl:
 
 
 # ===================================================================
+# x_get_user_posts via Xquik
+# ===================================================================
+
+
+class TestUserPostsXquik:
+    @pytest.fixture()
+    def force_xquik(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("X_SEARCH_BACKEND", "xquik")
+
+    async def test_fetches_username_posts(
+        self, force_xquik: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: dict = {}
+
+        def fake_tweets(username, **k):
+            seen["username"] = username
+            return XQUIK_PAYLOAD
+
+        monkeypatch.setattr(xquik_client, "get_user_tweets", fake_tweets)
+
+        out = await x_get_user_posts(XGetUserPostsInput(username="bob"))
+        assert seen["username"] == "bob"
+        assert "hello xquik world" in out
+
+    async def test_topic_filter_applied_client_side(
+        self, force_xquik: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            xquik_client, "get_user_tweets", lambda u, **k: XQUIK_PAYLOAD
+        )
+
+        out = await x_get_user_posts(
+            XGetUserPostsInput(username="bob", topic_filter="nomatch")
+        )
+        assert out == "No posts found."
+
+        out2 = await x_get_user_posts(
+            XGetUserPostsInput(username="bob", topic_filter="xquik")
+        )
+        assert "hello xquik world" in out2
+
+    async def test_user_not_found_error(
+        self, force_xquik: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail(u, **k):
+            raise xquik_client.XquikNotFoundError("user not found: @ghost")
+
+        monkeypatch.setattr(xquik_client, "get_user_tweets", fail)
+        out = await x_get_user_posts(XGetUserPostsInput(username="ghost"))
+        assert json.loads(out)["source"] == "xquik"
+
+
+# ===================================================================
+# x_get_trending via Xquik
+# ===================================================================
+
+
+class TestTrendingXquik:
+    @pytest.fixture()
+    def force_xquik(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("X_SEARCH_BACKEND", "xquik")
+
+    async def test_routes_trends_to_xquik(
+        self, force_xquik: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict = {}
+
+        def fake_trends(**kwargs):
+            captured.update(kwargs)
+            return XQUIK_TRENDS_PAYLOAD
+
+        monkeypatch.setattr(xquik_client, "get_trends", fake_trends)
+        out = await x_get_trending(XTrendingInput(region="Japan"))
+        assert "#Xquik" in out
+        assert captured["woeid"] == 23424856
+
+    async def test_trends_error_returns_formatted_error(
+        self, force_xquik: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail(**kwargs):
+            raise xquik_client.XquikRateLimitError("nope")
+
+        monkeypatch.setattr(xquik_client, "get_trends", fail)
+        out = await x_get_trending(XTrendingInput())
+        assert json.loads(out)["source"] == "xquik"
+
+    async def test_auto_falls_back_to_xai_on_trends_error(
+        self, monkeypatch: pytest.MonkeyPatch, fake_api_key: str
+    ) -> None:
+        monkeypatch.setenv("X_SEARCH_BACKEND", "auto")
+        monkeypatch.setattr(xurl_client, "available", lambda: False)
+        monkeypatch.setattr(xquik_client, "available", lambda: True)
+
+        def fail(**kwargs):
+            raise xquik_client.XquikError("transient")
+
+        async def fake_xai(prompt, *, x_search_config=None):
+            return "XAI-TRENDS-FALLBACK"
+
+        monkeypatch.setattr(xquik_client, "get_trends", fail)
+        monkeypatch.setattr(x_search_mcp, "_call_responses_api", fake_xai)
+
+        out = await x_get_trending(XTrendingInput())
+        assert out == "XAI-TRENDS-FALLBACK"
+
+
+# ===================================================================
 # x_auth_status
 # ===================================================================
 
@@ -274,6 +560,7 @@ class TestAuthStatus:
         assert out["configured_backend"] == "auto"
         assert out["effective_backend"] == "xurl"
         assert out["xurl_available"] is True
+        assert out["xquik_key_present"] is False
         assert out["xai_key_present"] is True
 
     async def test_auto_without_xurl_uses_xai(
@@ -284,7 +571,19 @@ class TestAuthStatus:
         out = json.loads(await x_auth_status())
         assert out["effective_backend"] == "xai"
         assert out["xurl_available"] is False
+        assert out["xquik_key_present"] is False
         assert out["xai_key_present"] is False
+
+    async def test_auto_without_xurl_uses_xquik_when_available(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("X_SEARCH_BACKEND", "auto")
+        monkeypatch.setattr(xurl_client, "available", lambda: False)
+        monkeypatch.setenv("XQUIK_API_KEY", "xquik-test-key")
+        out = json.loads(await x_auth_status())
+        assert out["effective_backend"] == "xquik"
+        assert out["xquik_key_present"] is True
+        assert out["xquik_base_url_configured"] is False
 
     async def test_forced_xurl_effective(
         self, monkeypatch: pytest.MonkeyPatch
@@ -293,6 +592,14 @@ class TestAuthStatus:
         monkeypatch.setattr(xurl_client, "available", lambda: False)
         out = json.loads(await x_auth_status())
         assert out["effective_backend"] == "xurl"
+
+    async def test_forced_xquik_effective(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("X_SEARCH_BACKEND", "xquik")
+        monkeypatch.setattr(xurl_client, "available", lambda: True)
+        out = json.loads(await x_auth_status())
+        assert out["effective_backend"] == "xquik"
 
     async def test_forced_xai_effective(
         self, monkeypatch: pytest.MonkeyPatch

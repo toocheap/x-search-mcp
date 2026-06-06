@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-X (Twitter) Search MCP Server via xAI Agent Tools API
+X (Twitter) Search MCP Server.
 
-Uses xAI's Responses API with built-in x_search tool to search
-X/Twitter posts. This is the new Agent Tools API that replaced
-the deprecated Live Search API.
+Supports xAI, xurl, and Xquik backends for searching X/Twitter posts.
+The xAI backend uses the Responses API with the x_search tool.
 
-Required environment variable:
-    XAI_API_KEY - Your xAI API key from https://console.x.ai/
+Optional environment variables:
+    X_SEARCH_BACKEND - auto, xurl, xquik, or xai
+    XAI_API_KEY - xAI API key from https://console.x.ai/
+    XQUIK_API_KEY - Xquik API key
+    XQUIK_BASE_URL - Optional Xquik API base URL override
 
 Usage with Claude Desktop:
     Add to claude_desktop_config.json:
@@ -17,7 +19,9 @@ Usage with Claude Desktop:
                 "command": "/path/to/.venv/bin/python3",
                 "args": ["/path/to/x_search_mcp.py"],
                 "env": {
-                    "XAI_API_KEY": "your-api-key-here"
+                    "XAI_API_KEY": "your-xai-api-key-here",
+                    "XQUIK_API_KEY": "your-xquik-api-key-here",
+                    "X_SEARCH_BACKEND": "auto"
                 }
             }
         }
@@ -35,6 +39,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
+import xquik_client
 import xurl_client
 
 # ---------------------------------------------------------------------------
@@ -47,11 +52,25 @@ DEFAULT_TIMEOUT = 120.0
 MAX_RESULTS_DEFAULT = 10
 
 # Data-source backend selection (env X_SEARCH_BACKEND):
-#   "auto" — use the authenticated xurl CLI when available, else xAI Grok
-#   "xurl" — force the official xurl CLI (real X API v2)
-#   "xai"  — force the xAI Responses API + x_search server-side tool
+#   "auto"  - use xurl when available, else Xquik when configured, else xAI
+#   "xurl"  - force the official xurl CLI (real X API v2)
+#   "xquik" - force Xquik REST API
+#   "xai"   - force the xAI Responses API + x_search server-side tool
 DEFAULT_BACKEND = "auto"
-VALID_BACKENDS = ("auto", "xurl", "xai")
+VALID_BACKENDS = ("auto", "xurl", "xquik", "xai")
+REGION_WOEIDS = {
+    "global": 1,
+    "worldwide": 1,
+    "united states": 23424977,
+    "us": 23424977,
+    "usa": 23424977,
+    "japan": 23424856,
+    "turkey": 23424969,
+    "united kingdom": 23424975,
+    "uk": 23424975,
+    "mexico": 23424900,
+    "spain": 23424950,
+}
 
 # ---------------------------------------------------------------------------
 # Server
@@ -182,13 +201,23 @@ def _should_use_xurl(backend: str) -> bool:
     """Decide whether to route a call through xurl for the given backend.
 
     'xurl' forces xurl (an unauthenticated CLI then surfaces its own error);
-    'xai' never uses xurl; 'auto' uses xurl only when it is authenticated.
+    'xai' and 'xquik' never use xurl; 'auto' uses xurl only when it is
+    authenticated.
     """
     if backend == "xurl":
         return True
-    if backend == "xai":
+    if backend in ("xai", "xquik"):
         return False
     return xurl_client.available()
+
+
+def _should_use_xquik(backend: str) -> bool:
+    """Decide whether to route a call through Xquik for the given backend."""
+    if backend == "xquik":
+        return True
+    if backend in ("xai", "xurl"):
+        return False
+    return xquik_client.available()
 
 
 def _handle_xurl_error(e: "xurl_client.XurlError") -> str:
@@ -210,6 +239,24 @@ def _handle_xurl_error(e: "xurl_client.XurlError") -> str:
     return json.dumps({"error": msg, "source": "xurl"})
 
 
+def _handle_xquik_error(e: "xquik_client.XquikError") -> str:
+    """Format an Xquik failure as a JSON error string with a remedy hint."""
+    if isinstance(e, xquik_client.XquikAuthError):
+        msg = (
+            "Xquik authentication failed. Check XQUIK_API_KEY, or set "
+            "X_SEARCH_BACKEND=xai to use the xAI backend."
+        )
+    elif isinstance(e, xquik_client.XquikRateLimitError):
+        msg = "Xquik rate limited (HTTP 429). Please wait before retrying."
+    elif isinstance(e, xquik_client.XquikQuotaError):
+        msg = "Xquik quota error (HTTP 402). Check your Xquik API access."
+    elif isinstance(e, xquik_client.XquikNotFoundError):
+        msg = str(e)
+    else:
+        msg = str(e)
+    return json.dumps({"error": msg, "source": "xquik"})
+
+
 def _xurl_search_posts(params: "XSearchPostsInput") -> str:
     """Run a keyword search through the xurl CLI and format the result."""
     query = params.query
@@ -224,6 +271,24 @@ def _xurl_search_posts(params: "XSearchPostsInput") -> str:
         to_date=params.to_date,
     )
     posts = xurl_client.posts_from_response(resp, limit=limit)
+    return xurl_client.format_posts(
+        posts, as_json=(params.response_format == ResponseFormat.JSON)
+    )
+
+
+def _xquik_search_posts(params: "XSearchPostsInput") -> str:
+    """Run a keyword search through Xquik and format the result."""
+    query = params.query
+    if params.language:
+        query = f"{query} lang:{params.language}"
+    limit = params.max_results or MAX_RESULTS_DEFAULT
+    resp = xquik_client.search_recent(
+        query,
+        max_results=limit,
+        from_date=params.from_date,
+        to_date=params.to_date,
+    )
+    posts = xquik_client.posts_from_response(resp, limit=limit)
     return xurl_client.format_posts(
         posts, as_json=(params.response_format == ResponseFormat.JSON)
     )
@@ -247,6 +312,34 @@ def _xurl_user_posts(params: "XGetUserPostsInput") -> str:
         posts = [p for p in posts if kw in p.get("text", "").lower()]
     return xurl_client.format_posts(
         posts, as_json=(params.response_format == ResponseFormat.JSON)
+    )
+
+
+def _xquik_user_posts(params: "XGetUserPostsInput") -> str:
+    """Fetch a user's recent posts through Xquik and format them."""
+    limit = params.max_results or MAX_RESULTS_DEFAULT
+    resp = xquik_client.get_user_tweets(
+        params.username,
+        max_results=limit,
+        from_date=params.from_date,
+        to_date=params.to_date,
+    )
+    posts = xquik_client.posts_from_response(resp, limit=limit)
+    if params.topic_filter:
+        kw = params.topic_filter.lower()
+        posts = [p for p in posts if kw in p.get("text", "").lower()]
+    return xurl_client.format_posts(
+        posts, as_json=(params.response_format == ResponseFormat.JSON)
+    )
+
+
+def _xquik_trends(params: "XTrendingInput") -> str:
+    """Fetch current trends through Xquik and format them."""
+    region = (params.region or "global").strip().lower()
+    woeid = REGION_WOEIDS.get(region, REGION_WOEIDS["global"])
+    resp = xquik_client.get_trends(count=10, woeid=woeid)
+    return xquik_client.format_trends(
+        resp, as_json=(params.response_format == ResponseFormat.JSON)
     )
 
 
@@ -406,7 +499,7 @@ def _build_x_search_config(
 async def x_search_posts(params: XSearchPostsInput) -> str:
     """Search for posts on X (Twitter) by keywords, hashtags, or topics.
 
-    Uses xAI's Grok API with live search to find recent and relevant
+    Routes through the configured backend to find recent and relevant
     X posts matching the search query.
 
     Args:
@@ -426,7 +519,15 @@ async def x_search_posts(params: XSearchPostsInput) -> str:
         except xurl_client.XurlError as e:
             if backend == "xurl":
                 return _handle_xurl_error(e)
-            # 'auto': fall through to the xAI backend on any xurl failure.
+            # 'auto': try Xquik if configured, then fall through to xAI.
+
+    if _should_use_xquik(backend):
+        try:
+            return await asyncio.to_thread(_xquik_search_posts, params)
+        except xquik_client.XquikError as e:
+            if backend == "xquik":
+                return _handle_xquik_error(e)
+            # 'auto': fall through to xAI on Xquik failure.
 
     try:
         lang_part = ""
@@ -467,8 +568,8 @@ async def x_search_posts(params: XSearchPostsInput) -> str:
 async def x_get_user_posts(params: XGetUserPostsInput) -> str:
     """Retrieve recent posts from a specific X (Twitter) user.
 
-    Uses xAI's Grok API with live search to find recent posts
-    from the specified user account.
+    Routes through the configured backend to find recent posts from the
+    specified user account.
 
     Args:
         params (XGetUserPostsInput): Validated input containing:
@@ -487,7 +588,15 @@ async def x_get_user_posts(params: XGetUserPostsInput) -> str:
         except xurl_client.XurlError as e:
             if backend == "xurl":
                 return _handle_xurl_error(e)
-            # 'auto': fall through to the xAI backend on any xurl failure.
+            # 'auto': try Xquik if configured, then fall through to xAI.
+
+    if _should_use_xquik(backend):
+        try:
+            return await asyncio.to_thread(_xquik_user_posts, params)
+        except xquik_client.XquikError as e:
+            if backend == "xquik":
+                return _handle_xquik_error(e)
+            # 'auto': fall through to xAI on Xquik failure.
 
     try:
         topic_part = ""
@@ -529,8 +638,8 @@ async def x_get_user_posts(params: XGetUserPostsInput) -> str:
 async def x_get_trending(params: XTrendingInput) -> str:
     """Get current trending topics and hashtags on X (Twitter).
 
-    Uses xAI's Grok API with live search to find what's currently
-    trending on X.
+    Routes through Xquik when selected or through xAI otherwise to find
+    what is currently trending on X.
 
     Args:
         params (XTrendingInput): Validated input containing:
@@ -541,6 +650,15 @@ async def x_get_trending(params: XTrendingInput) -> str:
     Returns:
         str: Trending topics formatted as markdown or JSON
     """
+    backend = _get_backend()
+    if _should_use_xquik(backend):
+        try:
+            return await asyncio.to_thread(_xquik_trends, params)
+        except xquik_client.XquikError as e:
+            if backend == "xquik":
+                return _handle_xquik_error(e)
+            # 'auto': fall through to xAI on Xquik failure.
+
     try:
         region_part = f" in {params.region}" if params.region else " globally"
         category_part = ""
@@ -565,7 +683,7 @@ async def x_get_trending(params: XTrendingInput) -> str:
 @mcp.tool(
     name="x_auth_status",
     annotations={
-        "title": "Check X Search Backend / xurl Auth Status",
+        "title": "Check X Search Backend Status",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -573,36 +691,42 @@ async def x_get_trending(params: XTrendingInput) -> str:
     },
 )
 async def x_auth_status() -> str:
-    """Report the configured backend and whether xurl is authenticated.
+    """Report the configured backend and whether credentials are available.
 
     Helps diagnose which data source the search tools will use. Reads only
-    `xurl auth status` (no billed request) and the presence of XAI_API_KEY.
-    The X API key value itself is never returned.
+    `xurl auth status` (no billed request) and environment key presence.
+    API key values are never returned.
 
     Returns:
         str: JSON describing the configured backend, the effective backend,
-            xurl availability, and whether an xAI key is present.
+            backend availability and whether API keys are present.
     """
     backend = _get_backend()
     xurl_ok = await asyncio.to_thread(xurl_client.available)
+    xquik_ok = xquik_client.available()
+    xquik_base_url_configured = bool(os.environ.get("XQUIK_BASE_URL"))
     has_xai_key = bool(os.environ.get("XAI_API_KEY"))
 
     if backend == "xurl":
         effective = "xurl"
+    elif backend == "xquik":
+        effective = "xquik"
     elif backend == "xai":
         effective = "xai"
     else:  # auto
-        effective = "xurl" if xurl_ok else "xai"
+        effective = "xurl" if xurl_ok else "xquik" if xquik_ok else "xai"
 
     return json.dumps(
         {
             "configured_backend": backend,
             "effective_backend": effective,
             "xurl_available": xurl_ok,
+            "xquik_key_present": xquik_ok,
+            "xquik_base_url_configured": xquik_base_url_configured,
             "xai_key_present": has_xai_key,
             "note": (
-                "x_get_trending always uses the xAI backend; the X API has no "
-                "stable trends endpoint available via xurl."
+                "x_get_trending uses Xquik when selected or available in "
+                "auto mode; otherwise it uses the xAI backend."
             ),
         },
         indent=2,

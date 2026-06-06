@@ -1,9 +1,10 @@
 # X (Twitter) Search MCP Server
 
-MCP 対応クライアントから X (Twitter) の投稿をリアルタイム検索できる MCP サーバーです。2 つのデータ源 backend を選べます：
+MCP 対応クライアントから X (Twitter) の投稿をリアルタイム検索できる MCP サーバーです。3 つのデータ源 backend を選べます：
 
-1. **xAI backend** — [Responses API](https://docs.x.ai/developers/tools/overview) + [x_search サーバーサイドツール](https://docs.x.ai/developers/tools/x-search)。Grok が自律的に X を検索・分析（セマンティック検索）。
-2. **xurl backend** — 公式 [`xurl`](https://github.com/xdevplatform/xurl) CLI 経由の認証済み実 X API v2。生のポストデータを直接取得。
+1. **xAI backend** - [Responses API](https://docs.x.ai/developers/tools/overview) + [x_search サーバーサイドツール](https://docs.x.ai/developers/tools/x-search)。Grok が自律的に X を検索・分析（セマンティック検索）。
+2. **xurl backend** - 公式 [`xurl`](https://github.com/xdevplatform/xurl) CLI 経由の認証済み実 X API v2。生のポストデータを直接取得。
+3. **Xquik backend** - [Xquik API](https://docs.xquik.com) 経由で検索、ユーザー投稿、トレンドを取得。
 
 backend は環境変数 `X_SEARCH_BACKEND` で切り替えます（既定 `auto`）。
 
@@ -13,21 +14,23 @@ backend は環境変数 `X_SEARCH_BACKEND` で切り替えます（既定 `auto`
 |---|---|
 | `x_search_posts` | キーワード・ハッシュタグ・トピックで X の投稿を検索 |
 | `x_get_user_posts` | 特定ユーザーの最近の投稿を取得 |
-| `x_get_trending` | トレンドトピックを取得（常に xAI backend を使用） |
-| `x_auth_status` | 有効な backend と xurl 認証状態を確認 |
+| `x_get_trending` | トレンドトピックを取得 |
+| `x_auth_status` | 有効な backend と認証状態を確認 |
 
 ## backend の選択（`X_SEARCH_BACKEND`）
 
 | 値 | 挙動 |
 |---|---|
-| `auto`（既定） | `xurl` が認証済みなら xurl を使用、未認証 / 失敗時は xAI にフォールバック |
+| `auto`（既定） | `xurl` が認証済みなら xurl、次に Xquik、最後に xAI を使用 |
 | `xurl` | `xurl` CLI を強制（実 X API v2） |
+| `xquik` | Xquik API を強制 |
 | `xai` | xAI Responses API を強制 |
 
 - **xAI backend** には `XAI_API_KEY` が必要です。
 - **xurl backend** には `xurl` CLI が PATH 上にあり OAuth2 認証済み（`xurl auth`）であることが必要です。
-- `auto` で xurl が利用できない環境では自動的に xAI にフォールバックするため、どちらか一方だけの構成でも動作します。
-- `x_get_trending` は xurl に安定したトレンド API が無いため常に xAI backend を使用します。
+- **Xquik backend** には `XQUIK_API_KEY` が必要です。必要に応じて `XQUIK_BASE_URL` で API ベース URL を変更できます。
+- `auto` で xurl が利用できない環境では、Xquik のキーがあれば Xquik、無ければ xAI にフォールバックします。
+- `x_get_trending` は Xquik backend が選択または利用可能な `auto` の場合は Xquik を使用し、それ以外では xAI を使用します。
 
 ## 対応クライアント
 
@@ -52,10 +55,11 @@ stdio トランスポートに対応した MCP クライアントであれば利
 ### 前提条件
 
 - Python 3.10 以上
-- xAI API キー（ https://console.x.ai/ から取得）— xAI backend を使う場合
-- `xurl` CLI（ https://github.com/xdevplatform/xurl ）を導入し `xurl auth` で認証 — xurl backend を使う場合
+- xAI API キー（ https://console.x.ai/ から取得） - xAI backend を使う場合
+- `xurl` CLI（ https://github.com/xdevplatform/xurl ）を導入し `xurl auth` で認証 - xurl backend を使う場合
+- Xquik API キー（ https://docs.xquik.com 参照） - Xquik backend を使う場合
 
-> いずれか一方だけでも動作します。両方を用意して `X_SEARCH_BACKEND=auto`（既定）にすると、xurl 優先・xAI フォールバックになります。
+> いずれか一方だけでも動作します。複数を用意して `X_SEARCH_BACKEND=auto`（既定）にすると、xurl、Xquik、xAI の順に利用します。
 
 ### 1. リポジトリのクローンと仮想環境の作成
 
@@ -103,6 +107,7 @@ which python3
             "args": ["/absolute/path/to/x-search-mcp/x_search_mcp.py"],
             "env": {
                 "XAI_API_KEY": "xai-xxxxxxxxxxxxxxxxxxxxxxxx",
+                "XQUIK_API_KEY": "xquik-xxxxxxxxxxxxxxxxxxxxxxxx",
                 "X_SEARCH_BACKEND": "auto"
             }
         }
@@ -114,7 +119,8 @@ which python3
 > - `command` には **手順2で確認した仮想環境の Python フルパス**を指定してください。システムの `python3` ではなく `.venv` 内のものを使います。
 > - `args` には `x_search_mcp.py` の**絶対パス**を指定してください。
 > - `XAI_API_KEY` には https://console.x.ai/ で取得した API キーを設定してください（xAI backend 用）。
-> - `X_SEARCH_BACKEND` は `auto`（既定）/ `xurl` / `xai` から選びます。省略時は `auto`。xurl backend は MCP サーバーを起動するユーザーの `xurl` 認証情報（`~/.xurl`）を使うため、`env` に資格情報を書く必要はありません。
+> - `XQUIK_API_KEY` には Xquik API キーを設定してください（Xquik backend 用）。
+> - `X_SEARCH_BACKEND` は `auto`（既定）/ `xurl` / `xquik` / `xai` から選びます。省略時は `auto`。xurl backend は MCP サーバーを起動するユーザーの `xurl` 認証情報（`~/.xurl`）を使うため、`env` に資格情報を書く必要はありません。
 
 <details>
 <summary>クライアント別の設定ファイルの場所</summary>
@@ -146,13 +152,14 @@ MCP クライアントで以下のように話しかけるだけです：
 ## アーキテクチャ
 
 ```
-                          ┌─ (xai)  xAI Responses API (/v1/responses) ─ x_search tool ─┐
-MCP Client <-> MCP Server ┤                                                            ├─> X (Twitter) data
-        (stdio)           └─ (xurl) xurl CLI ─ X API v2 (/2/tweets/search/recent 等) ──┘
+                          ┌─ (xai)   xAI Responses API (/v1/responses) ─ x_search tool ─┐
+MCP Client <-> MCP Server ┼─ (xquik) Xquik API (/api/v1/x/*, /api/v1/trends) ───────────┼─> X (Twitter) data
+        (stdio)           └─ (xurl)  xurl CLI ─ X API v2 (/2/tweets/search/recent 等) ──┘
 ```
 
 - **xAI backend**: xAI の **Responses API** と **x_search サーバーサイドツール**を使用。Grok がサーバーサイドで自律的に X を検索・分析し、結果を返すエージェンティックな仕組みです。旧 Live Search API (`search_parameters`) は 2026年1月に廃止されたため、新しい Agent Tools API を使用しています。
 - **xurl backend**: 公式 `xurl` CLI 経由で認証済みの X API v2 エンドポイント（`/2/tweets/search/recent`, `/2/users/:id/tweets` 等）を直接呼び出し、生のポストを取得します。アダプタは `xurl_client.py` に実装されています。
+- **Xquik backend**: Xquik API の検索、ユーザー投稿、トレンドエンドポイントを呼び出します。アダプタは `xquik_client.py` に実装されています。
 
 ## モデル
 
@@ -177,8 +184,9 @@ MCP Client <-> MCP Server ┤                                                   
 | `status 410: Live search is deprecated` | 旧 API を使用 | 最新版に更新（`git pull`） |
 | `{"error": "xurl is not authenticated...", "source": "xurl"}` | `X_SEARCH_BACKEND=xurl` だが xurl 未認証 | `xurl auth` で認証する、または `X_SEARCH_BACKEND=xai` に変更 |
 | `{"error": "...HTTP 429...", "source": "xurl"}` | xurl のレート制限 | 時間をおいて再試行（429 は内部でバックオフ再試行済み） |
+| `{"error": "...", "source": "xquik"}` | Xquik API キー、レート制限、または API アクセスの問題 | `XQUIK_API_KEY` と Xquik API アクセスを確認 |
 
-`x_auth_status` ツールを呼ぶと、現在有効な backend と xurl の認証状態を確認できます。
+`x_auth_status` ツールを呼ぶと、現在有効な backend、xurl の認証状態、Xquik / xAI キーの有無を確認できます。キーの値は返しません。
 
 Claude Desktop の場合、ログは以下で確認できます：
 
@@ -189,7 +197,7 @@ cat ~/Library/Logs/Claude/mcp-server-x_search.log
 
 ## 料金
 
-xAI API の利用料金が発生します。詳細は [xAI Pricing](https://docs.x.ai/developers/models) を参照してください。
+選択した backend の API 利用料金が発生します。xAI は [xAI Pricing](https://docs.x.ai/developers/models)、Xquik は [Xquik Docs](https://docs.xquik.com) を参照してください。
 
 ## ライセンス
 
