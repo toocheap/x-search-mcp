@@ -11,6 +11,18 @@ import pytest
 # Environment variable fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def default_xai_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the backend to 'xai' by default for determinism.
+
+    Without this, 'auto' would shell out to the real `xurl` CLI during unit
+    tests (whose result varies by machine: authenticated dev box vs. clean
+    CI). Tests that exercise the xurl path override X_SEARCH_BACKEND
+    explicitly. This keeps the existing xAI-path tests meaningful everywhere.
+    """
+    monkeypatch.setenv("X_SEARCH_BACKEND", "xai")
+
+
 @pytest.fixture()
 def fake_api_key(monkeypatch: pytest.MonkeyPatch) -> str:
     """Set a fake XAI_API_KEY and return the value."""

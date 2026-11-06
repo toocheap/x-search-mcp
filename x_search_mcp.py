@@ -24,6 +24,7 @@ Usage with Claude Desktop:
     }
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -34,6 +35,8 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
+import xurl_client
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -42,6 +45,13 @@ XAI_API_BASE = "https://api.x.ai/v1"
 XAI_MODEL = "grok-4-1-fast"
 DEFAULT_TIMEOUT = 120.0
 MAX_RESULTS_DEFAULT = 10
+
+# Data-source backend selection (env X_SEARCH_BACKEND):
+#   "auto" — use the authenticated xurl CLI when available, else xAI Grok
+#   "xurl" — force the official xurl CLI (real X API v2)
+#   "xai"  — force the xAI Responses API + x_search server-side tool
+DEFAULT_BACKEND = "auto"
+VALID_BACKENDS = ("auto", "xurl", "xai")
 
 # ---------------------------------------------------------------------------
 # Server
@@ -155,6 +165,89 @@ def _handle_api_error(e: Exception) -> str:
     if isinstance(e, RuntimeError):
         return json.dumps({"error": str(e)})
     return json.dumps({"error": f"Unexpected error: {type(e).__name__}: {e}"})
+
+
+# ---------------------------------------------------------------------------
+# Backend selection (xurl vs xAI)
+# ---------------------------------------------------------------------------
+
+
+def _get_backend() -> str:
+    """Return the configured backend, defaulting to 'auto' on unknown values."""
+    val = os.environ.get("X_SEARCH_BACKEND", DEFAULT_BACKEND).strip().lower()
+    return val if val in VALID_BACKENDS else DEFAULT_BACKEND
+
+
+def _should_use_xurl(backend: str) -> bool:
+    """Decide whether to route a call through xurl for the given backend.
+
+    'xurl' forces xurl (an unauthenticated CLI then surfaces its own error);
+    'xai' never uses xurl; 'auto' uses xurl only when it is authenticated.
+    """
+    if backend == "xurl":
+        return True
+    if backend == "xai":
+        return False
+    return xurl_client.available()
+
+
+def _handle_xurl_error(e: "xurl_client.XurlError") -> str:
+    """Format an xurl failure as a JSON error string with a remedy hint."""
+    if isinstance(e, xurl_client.XurlAuthError):
+        msg = (
+            "xurl is not authenticated. Run `xurl auth` (or "
+            "`xurl auth apps add ...`) outside the agent, or set "
+            "X_SEARCH_BACKEND=xai to use the xAI backend."
+        )
+    elif isinstance(e, xurl_client.XurlRateLimitError):
+        msg = "xurl rate limited (HTTP 429). Please wait before retrying."
+    elif isinstance(e, xurl_client.XurlQuotaError):
+        msg = "xurl quota error (HTTP 402). Check your X API plan."
+    elif isinstance(e, xurl_client.XurlNotFoundError):
+        msg = str(e)
+    else:
+        msg = str(e)
+    return json.dumps({"error": msg, "source": "xurl"})
+
+
+def _xurl_search_posts(params: "XSearchPostsInput") -> str:
+    """Run a keyword search through the xurl CLI and format the result."""
+    query = params.query
+    if params.language:
+        # X API search supports a `lang:` operator for language filtering.
+        query = f"{query} lang:{params.language}"
+    limit = params.max_results or MAX_RESULTS_DEFAULT
+    resp = xurl_client.search_recent(
+        query,
+        max_results=limit,
+        from_date=params.from_date,
+        to_date=params.to_date,
+    )
+    posts = xurl_client.posts_from_response(resp, limit=limit)
+    return xurl_client.format_posts(
+        posts, as_json=(params.response_format == ResponseFormat.JSON)
+    )
+
+
+def _xurl_user_posts(params: "XGetUserPostsInput") -> str:
+    """Fetch a user's recent posts through the xurl CLI and format them."""
+    limit = params.max_results or MAX_RESULTS_DEFAULT
+    user_id = xurl_client.get_user_by_username(params.username)
+    resp = xurl_client.get_user_tweets(
+        user_id,
+        max_results=limit,
+        from_date=params.from_date,
+        to_date=params.to_date,
+    )
+    posts = xurl_client.posts_from_response(resp, limit=limit)
+    if params.topic_filter:
+        # The X API user-timeline endpoint has no server-side text filter, so
+        # apply the topic filter client-side over the returned posts.
+        kw = params.topic_filter.lower()
+        posts = [p for p in posts if kw in p.get("text", "").lower()]
+    return xurl_client.format_posts(
+        posts, as_json=(params.response_format == ResponseFormat.JSON)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +419,15 @@ async def x_search_posts(params: XSearchPostsInput) -> str:
     Returns:
         str: Search results formatted as markdown or JSON
     """
+    backend = _get_backend()
+    if _should_use_xurl(backend):
+        try:
+            return await asyncio.to_thread(_xurl_search_posts, params)
+        except xurl_client.XurlError as e:
+            if backend == "xurl":
+                return _handle_xurl_error(e)
+            # 'auto': fall through to the xAI backend on any xurl failure.
+
     try:
         lang_part = ""
         if params.language:
@@ -378,6 +480,15 @@ async def x_get_user_posts(params: XGetUserPostsInput) -> str:
     Returns:
         str: User's recent posts formatted as markdown or JSON
     """
+    backend = _get_backend()
+    if _should_use_xurl(backend):
+        try:
+            return await asyncio.to_thread(_xurl_user_posts, params)
+        except xurl_client.XurlError as e:
+            if backend == "xurl":
+                return _handle_xurl_error(e)
+            # 'auto': fall through to the xAI backend on any xurl failure.
+
     try:
         topic_part = ""
         if params.topic_filter:
@@ -449,6 +560,53 @@ async def x_get_trending(params: XTrendingInput) -> str:
 
     except Exception as e:
         return _handle_api_error(e)
+
+
+@mcp.tool(
+    name="x_auth_status",
+    annotations={
+        "title": "Check X Search Backend / xurl Auth Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def x_auth_status() -> str:
+    """Report the configured backend and whether xurl is authenticated.
+
+    Helps diagnose which data source the search tools will use. Reads only
+    `xurl auth status` (no billed request) and the presence of XAI_API_KEY.
+    The X API key value itself is never returned.
+
+    Returns:
+        str: JSON describing the configured backend, the effective backend,
+            xurl availability, and whether an xAI key is present.
+    """
+    backend = _get_backend()
+    xurl_ok = await asyncio.to_thread(xurl_client.available)
+    has_xai_key = bool(os.environ.get("XAI_API_KEY"))
+
+    if backend == "xurl":
+        effective = "xurl"
+    elif backend == "xai":
+        effective = "xai"
+    else:  # auto
+        effective = "xurl" if xurl_ok else "xai"
+
+    return json.dumps(
+        {
+            "configured_backend": backend,
+            "effective_backend": effective,
+            "xurl_available": xurl_ok,
+            "xai_key_present": has_xai_key,
+            "note": (
+                "x_get_trending always uses the xAI backend; the X API has no "
+                "stable trends endpoint available via xurl."
+            ),
+        },
+        indent=2,
+    )
 
 
 # ---------------------------------------------------------------------------

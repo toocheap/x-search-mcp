@@ -8,3 +8,7 @@ venv/
 dist/
 build/
 .DS_Store
+
+.coverage
+.claude/
+.pytest_cache/
